@@ -3,6 +3,8 @@
 Created on Wed Jul 29 18:26:43 2020
 
 @author: mmo990
+
+This script is based on the Classification script from Chris Holden and Florian Beyer
 """
 
 import ogr
@@ -15,7 +17,7 @@ from collections import Counter
 import math
 import sys
 from osgeo import ogr, gdal_array, gdalconst
-from scipy.ndimage import label, binary_dilation
+from scipy.ndimage import label, binary_dilation, median_filter
 from shapely.geometry import box
 
 import rasterio
@@ -26,16 +28,17 @@ from rasterio.mask import mask
 import matplotlib
 import matplotlib.pyplot as plt
 
+import sklearn
+from sklearn import ensemble
 from sklearn.ensemble import RandomForestClassifier
-from RandomForestClassifier import get_params
-from sklearn import metrics
-from sklearn.model_selection import train_test_split, RandomizedSearchCV
+#from sklearn.ensemble.RandomForestClassifier import get_params
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.model_selection import train_test_split, GridSearchCV
 import pprint
 
 import skimage
 from skimage.filters.rank import modal
 from skimage.morphology import disk
-
 
 
 # --------------------------------------------------------
@@ -211,10 +214,8 @@ def refl(in_raster, absFactors, effBandWidths, ESUN, dES, theta, out_raster_TOA,
     return output_TOA, output_surf
 
 
-
-
-# This creates interget id attributes in shapefile based on class names and then saves training data as a raster file
-def rasterize_train_data(ref_ras, shp_file, csv_class_name_id, shp_file_with_ids, out_ras):
+# This creates interger id attributes in shapefile based on class names, splots the training data into trainig and test subsets and then saves them to a raster file
+def rasterize_and_split_train_data(ref_ras, shp_file, csv_class_name_id, train_file_with_ids, test_file_with_ids, train_out_ras, test_out_ras):
     # Create id in shp corresponding to class name in shapefile
     gdf = gpd.read_file(shp_file)
     class_names = gdf['Class name'].unique()
@@ -227,261 +228,367 @@ def rasterize_train_data(ref_ras, shp_file, csv_class_name_id, shp_file_with_ids
     gdf['id'] = gdf['Class name'].map(dict(zip(class_names, class_ids)))
     print('gdf with ids', gdf.head())
 
-    gdf.to_file(shp_file_with_ids)
-    
+    train, test = train_test_split(gdf, test_size = 0.3, stratify = gdf['id'], random_state = 1)
+    train.to_file(train_file_with_ids)
+    test.to_file(test_file_with_ids)
     # Open reference raster
     in_ras = gdal.Open(ref_ras)
     
-    train_ds = ogr.Open(shp_file_with_ids)
-    lyr = train_ds.GetLayer()
+    train_ds = ogr.Open(train_file_with_ids)
+    test_ds = ogr.Open(test_file_with_ids)
+    train_lyr = test_ds.GetLayer()
+    test_lyr = train_ds.GetLayer()
     
-    # Create new raster layer (training data raster)
+    # Create new training raster layer
     driver = gdal.GetDriverByName('GTiff')
-    target_ds = driver.Create(out_ras, in_ras.RasterXSize, in_ras.RasterYSize, 1, gdal.GDT_UInt16)
+    target_ds = driver.Create(train_out_ras, in_ras.RasterXSize, in_ras.RasterYSize, 1, gdal.GDT_UInt16)
     target_ds.SetGeoTransform(in_ras.GetGeoTransform())
     target_ds.SetProjection(in_ras.GetProjection())
     
+    # Create new test raster layer
+    driver = gdal.GetDriverByName('GTiff')
+    target_ds_2 = driver.Create(test_out_ras, in_ras.RasterXSize, in_ras.RasterYSize, 1, gdal.GDT_UInt16)
+    target_ds_2.SetGeoTransform(in_ras.GetGeoTransform())
+    target_ds_2.SetProjection(in_ras.GetProjection())
+    
     # Rasterise training points
     options = ['ATTRIBUTE=id']
-    gdal.RasterizeLayer(target_ds, [1], lyr, options=options)
-    
+    gdal.RasterizeLayer(target_ds, [1], train_lyr, options=options)
+    gdal.RasterizeLayer(target_ds_2, [1], test_lyr, options=options)
     
     # Check generated training data raster and display basic stats
     data = target_ds.GetRasterBand(1).ReadAsArray()
-    print('min', data.min(), 'max', data.max(), 'mean', data.mean())
+    print('Train', 'min', data.min(), 'max', data.max(), 'mean', data.mean())
+    
+    # Check generated training data raster and display basic stats
+    data = target_ds_2.GetRasterBand(1).ReadAsArray()
+    print('Test','min', data.min(), 'max', data.max(), 'mean', data.mean())
 
     # Save raster file
     target_ds = None
+    target_ds_2 = None
 
 
-    
-    
-
-
-# i is a float (e.g. 0.3) used to divide test and training data
-def classification(img, trai, i, out):
+def classification_with_hyperparameter_optimisation(img, trai, val, out_ras_prediction, out_ras_clean, f):
     gdal.UseExceptions()
     gdal.AllRegister()
 
-    # Read in raster and training raster
+    # Read in image to be classified
     img_ds = gdal.Open(img)
-    trai_ds = gdal.Open(trai)
-
     img = np.zeros((img_ds.RasterYSize, img_ds.RasterXSize, img_ds.RasterCount), \
-               gdal_array.GDALTypeCodeToNumericTypeCode(img_ds.GetRasterBand(1).DataType))
-    
+               gdal_array.GDALTypeCodeToNumericTypeCode(img_ds.GetRasterBand(1).DataType))   
     # Read each band into an array
     for b in range(img.shape[2]):
         img[:, :, b] = img_ds.GetRasterBand(b + 1).ReadAsArray()
-    
+            
+    # Read in training data raster
+    trai_ds = gdal.Open(trai)        
     trai = trai_ds.GetRasterBand(1).ReadAsArray().astype(np.uint8)
-
     # Check NoData value = 0
     print(trai_ds.GetRasterBand(1).GetNoDataValue())
+    
+    # Read in validation data raster
+    val_ds = gdal.Open(val)        
+    val = val_ds.GetRasterBand(1).ReadAsArray().astype(np.uint8)
+    # Check NoData value = 0
+    print(val_ds.GetRasterBand(1).GetNoDataValue())
+    
+    # Display satellite image and training data
+    plt.subplot(121)
+    plt.imshow(img[:, :, 0], cmap=plt.cm.Greys_r)
+    plt.title('RS image - first band')
 
-    # Find how many non-zero entries we have -- i.e how many trainign data samples?
+    plt.subplot(122)
+    plt.imshow(trai, cmap=plt.cm.Spectral)
+    plt.title('Training data')
+    
+    # Find how many non-zero entries we have -- i.e how many training data samples?
     n_samples = (trai > 0).sum()
-    print('We have {n} samples'.format(n=n_samples))
+    print('We have {n} training samples'.format(n=n_samples))
 
     # What are the classficiation labels?
     labels = np.unique(trai[trai>0])
-    print('The training data include {n} classes: {classes}'.format(n=labels.size, classes=labels))
-
-    # We will need a 'X' matrix containing out features - data in training matrix rows and a 'y' array containing our labels - cols, these will have n sample rows
-    X = img[trai>0, :]
+    print('The training data includes {n} classes: {classes}'.format(n=labels.size, classes=labels))
+     
+    # We will need a 'X' matrix containing our features - data in training matrix rows and a 'y' array containing our labels - cols, these will have n sample rows
     y = trai[trai>0]
+    x = img[trai>0, :]
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size = i)
-
-    print('Our X matrix is sized: {sz}'.format(sz=X.shape))
+    print('Our x matrix is sized: {sz}'.format(sz=x.shape))
     print('Our y matrix is sized: {sz}'.format(sz=y.shape))
-    
-
-    # Initialise our model with 250 trees - optimize
-    rf = RandomForestClassifier(n_estimators = 75, oob_score=True)
+        
+    # Initialise Random Forest Classifier, n_jobs = -1 utilises all available cores
+    rf = RandomForestClassifier(oob_score=True, n_jobs = -1)
 
     # Fit our model to training data
-    rf = rf.fit(X_train,y_train)
-  
-    for b, imp in zip(range(img_ds.RasterCount), rf.feature_importances_):
-        print('Band {b} importance: {imp}'.format(b=b, imp=imp))
-        
-    # Look at parameters used by current forest
-    #print('Parameters currently in use:\n')
-    #pprint(rf.get_params())
+    rf = rf.fit(x,y)
     
+    # Check the "Out-of-Bag" (OOB) prediction score
+    print('OOB prediction of accuracy is: {oob}%'.format(oob=rf.oob_score_ * 100))
+        
+    # Show the band importance:
+    bands = range(1,img_ds.RasterCount+1)
+
+    for b, imp in zip(bands, rf.feature_importances_):
+        print('Band {b} importance: {imp}'.format(b=b, imp=imp))
+
     # Take our full image and reshape it into a long 2d array (nrow * ncol, nband) for classification
     # Change to img.shape[2]-1 when using 4 bands (stacked NDWI + RGB)
     new_shape = (img.shape[0] * img.shape[1], img.shape[2])
-
     img_as_array = img[:, :, :img.shape[2]].reshape(new_shape)
     print('Reshaped from {o} to {n}'.format(o=img.shape, n=img_as_array.shape))
 
     # Now predict for each pixel
     class_prediction = rf.predict(img_as_array)
-
-    # F1 score
-    #score = metrics.f1_score(y_test, class_prediction, pos_label=list(set(y_test)))
-    # Overall accuracy
-    #pscore = metrics.accuracy_score(y_test, )
-    
-    print('Our prediction matrix is sized: {sz}'.format(sz=class_prediction.shape))
-    print('Our y test matrix is sized: {sz}'.format(sz=y_test.shape))
-    y2 = y_test.reshape((len(y_test), 1))
-    pred2 = class_prediction.reshape((len(class_prediction), 1))
-    print('Our updated prediction matrix is sized: {sz}'.format(sz=pred2.shape))
-    print('Our updated y test matrix is sized: {sz}'.format(sz=y2.shape))
-    
-    # Check accuracy - these didn't work for me
-    #print('Mean Absolute Error:', metrics.mean_absolute_error(y2, pred2))
-    #print('Mean Square Error:', metrics.mean_squared_error(y_test, class_prediction))
-    #print('Root Mean Squared Error:', np.sqrt(metrics.mean_squared_error(y_test, class_prediction)))
-    
-    # Metrics to evaluate classification - these didn't work for me
-    #print(metrics.confusion_matrix(y_test, class_prediction))
-    #print(metrics.classification_report(y_test, class_prediction))
-    #print(metrics.accuracy_score(y_test, class_prediction))
-    #print(metrics.cohen_kappa_score(y_test, class_prediction))
-
-    # Reshape classification map
+        
+    # Reshape back into original size
     class_prediction = class_prediction.reshape(img[:, :, 0].shape)
+    print('Reshaped back to {}'.format(class_prediction.shape))
+    
+    # Subset the classification image with the validation image = X
+    # Mask the classes on the validation dataset = y
+    # These will have n_samples rows
+    X_v = class_prediction[val > 0]
+    y_v = val[val > 0]
 
-    print('Our OOB prediction of accuracy is: {oob}'.format(oob=rf.oob_score_*100))
+    # Check accuracy of model wtih default scikit-learn parameters
+    print(confusion_matrix(y_v, X_v))
+    print(classification_report(y_v, X_v))
+    print(accuracy_score(y_v, X_v))
+  
+    # Set parameters and ranges to be tested
+    n_estimators = np.arange(25, 100, 5)
+    max_depth = [5, 8, 15, 25, 30]
+    min_samples_split = [2, 5, 10, 15, 100]
+    min_samples_leaf = [1, 2, 5, 10]
+    
+    # Set parameters and ranges into a dictionary
+    hyperF = dict(n_estimators = n_estimators, max_depth = max_depth, min_samples_split = min_samples_split, min_samples_leaf = min_samples_leaf)
+    
+    # Perform grid search to find the best parameters
+    gridF = GridSearchCV(rf, hyperF, cv = 3, verbose = 1, n_jobs = -1)
+    bestF = gridF.fit(x, y)
+    print(bestF.best_params_)
+    
+    # Apply optimised model to entire image as array
+    prediction = bestF.predict(img_as_array)
+    
+    # Reshape back into original size
+    class_prediction = prediction.reshape(img[:, :, 0].shape)
+    print('Reshaped back to {}'.format(class_prediction.shape))
+    
+    # Subset the classification image with the validation image = X
+    # Mask the classes on the validation dataset = y
+    # These will have n_samples rows
+    X_v = class_prediction[val > 0]
+    y_v = val[val > 0]
 
-    trai_ds = None
-     
+    # Check accuracy of model wtih default scikit-learn parameters
+    print(confusion_matrix(y_v, X_v))
+    print(classification_report(y_v, X_v))
+    print(accuracy_score(y_v, X_v))
+    
+    # Get info to save output raster from input raster
     geo = img_ds.GetGeoTransform()
     proj = img_ds.GetProjectionRef()
 
-    ncol = img_ds.RasterXSize
-    nrow = img_ds.RasterYSize
+    ncol = img.shape[1]
+    nrow = img.shape[0]
 
     drv = gdal.GetDriverByName('GTiff')
-    ds = drv.Create(out, ncol, nrow, 1, gdal.GDT_Byte)
-
-    ds.SetGeoTransform(geo)
-    ds.SetProjection(proj)
-
-    ds.GetRasterBand(1).WriteArray(class_prediction)
-
-    ds = None
     
-    return rf, X_train, y_train, X_test, y_test
+    class_prediction.astype(np.float16)
+    
+    out_ras_prediction = drv.Create(out_ras_prediction, ncol, nrow, 1, gdal.GDT_UInt16)
+    out_ras_prediction.SetProjection(proj)
+    out_ras_prediction.SetGeoTransform(geo)       
+    out_ras_prediction.GetRasterBand(1).WriteArray(class_prediction)
+    out_ras_prediction = None
 
-## Clean up salt and pepper from classification
-def cleanup(in_raster, out_raster, disk_size):
+    # Apply median filter to do salt and pepper cleanup
+    cleaned = skimage.filters.rank.modal(class_prediction, skimage.morphology.disk(f))
+    
+    # Reshape our cleaned classification map
+    cleaned = cleaned.reshape(img[:, :, 0].shape)
+    
+    # Subset the classification image with the validation image = X
+    # Mask the classes on the validation dataset = y
+    # These will have n_samples rows
+    X_v = cleaned[val > 0]
+    y_v = val[val > 0]
+
+    # Check accuracy of model wtih default scikit-learn parameters
+    print(confusion_matrix(y_v, X_v))
+    print(classification_report(y_v, X_v))
+    print(accuracy_score(y_v, X_v))
+    
+    out_ras_cleaned = drv.Create(out_ras_clean, ncol, nrow, 1, gdal.GDT_Byte)
+    out_ras_cleaned.SetProjection(proj)
+    out_ras_cleaned.SetGeoTransform(geo)       
+    out_ras_cleaned.GetRasterBand(1).WriteArray(cleaned)
+    out_ras_cleaned = None
+    
+    return 
+
+# Classification without GridSearch to find the best hyperparameters (faster)
+def classification(img, trai, val, out_ras_prediction, out_ras_clean, f):
+    gdal.UseExceptions()
+    gdal.AllRegister()
+
+    # Read in image to be classified
+    img_ds = gdal.Open(img)
+    img = np.zeros((img_ds.RasterYSize, img_ds.RasterXSize, img_ds.RasterCount), \
+               gdal_array.GDALTypeCodeToNumericTypeCode(img_ds.GetRasterBand(1).DataType))   
+    # Read each band into an array
+    for b in range(img.shape[2]):
+        img[:, :, b] = img_ds.GetRasterBand(b + 1).ReadAsArray()
+            
+    # Read in training data raster
+    trai_ds = gdal.Open(trai)        
+    trai = trai_ds.GetRasterBand(1).ReadAsArray().astype(np.uint8)
+    # Check NoData value = 0
+    print(trai_ds.GetRasterBand(1).GetNoDataValue())
+    
+    # Read in validation data raster
+    val_ds = gdal.Open(val)        
+    val = val_ds.GetRasterBand(1).ReadAsArray().astype(np.uint8)
+    # Check NoData value = 0
+    print(val_ds.GetRasterBand(1).GetNoDataValue())
+    
+    # Display satellite image and training data
+    plt.subplot(121)
+    plt.imshow(img[:, :, 0], cmap=plt.cm.Greys_r)
+    plt.title('RS image - first band')
+
+    plt.subplot(122)
+    plt.imshow(trai, cmap=plt.cm.Spectral)
+    plt.title('Training data')
+    
+    # Find how many non-zero entries we have -- i.e how many training data samples?
+    n_samples = (trai > 0).sum()
+    print('We have {n} training samples'.format(n=n_samples))
+
+    # What are the classficiation labels?
+    labels = np.unique(trai[trai>0])
+    print('The training data includes {n} classes: {classes}'.format(n=labels.size, classes=labels))
+     
+    # We will need a 'X' matrix containing our features - data in training matrix rows and a 'y' array containing our labels - cols, these will have n sample rows
+    y = trai[trai>0]
+    x = img[trai>0, :]
+
+    print('Our x matrix is sized: {sz}'.format(sz=x.shape))
+    print('Our y matrix is sized: {sz}'.format(sz=y.shape))
+        
+    # Initialise Random Forest Classifier, n_jobs = -1 utilises all available cores, add parameters as wanted
+    rf = RandomForestClassifier(oob_score=True, n_jobs = -1)
+
+    # Fit our model to training data
+    rf = rf.fit(x,y)
+    
+    # Check the "Out-of-Bag" (OOB) prediction score
+    print('OOB prediction of accuracy is: {oob}%'.format(oob=rf.oob_score_ * 100))
+        
+    # Show the band importance:
+    bands = range(1,img_ds.RasterCount+1)
+
+    for b, imp in zip(bands, rf.feature_importances_):
+        print('Band {b} importance: {imp}'.format(b=b, imp=imp))
+
+    # Take our full image and reshape it into a long 2d array (nrow * ncol, nband) for classification
+    # Change to img.shape[2]-1 when using 4 bands (stacked NDWI + RGB)
+    new_shape = (img.shape[0] * img.shape[1], img.shape[2])
+    img_as_array = img[:, :, :img.shape[2]].reshape(new_shape)
+    print('Reshaped from {o} to {n}'.format(o=img.shape, n=img_as_array.shape))
+
+    # Now predict for each pixel
+    class_prediction = rf.predict(img_as_array)
+        
+    # Reshape back into original size
+    class_prediction_reshape = class_prediction.reshape(img[:, :, 0].shape)
+    print('Reshaped back to {}'.format(class_prediction_reshape.shape))
+    
+    # Subset the classification image with the validation image = X
+    # Mask the classes on the validation dataset = y
+    # These will have n_samples rows
+    X_v = class_prediction_reshape[val > 0]
+    y_v = val[val > 0]
+
+    # Check accuracy of model wtih default scikit-learn parameters
+    print(confusion_matrix(y_v, X_v))
+    print(classification_report(y_v, X_v))
+    print(accuracy_score(y_v, X_v))
+    
+    # Get info to save output raster from input raster
+    geo = img_ds.GetGeoTransform()
+    proj = img_ds.GetProjectionRef()
+
+    ncol = img.shape[1]
+    nrow = img.shape[0]
+
     drv = gdal.GetDriverByName('GTiff')
-    raster = gdal.Open(in_raster)
-    ncol = raster.RasterXSize
-    nrow = raster.RasterYSize
-    # Fetch projection and extent
-    proj = raster.GetProjectionRef()
-    ext = raster.GetGeoTransform()
     
-    raster_array = raster.ReadAsArray()
+    class_prediction_reshape.astype(np.float16)
     
-    # Create mask so that ponds are not included in filter
-    mask_ = np.zeros(raster_array.shape, dtype=np.uint8)
-    boolean = raster_array != 2
-    mask_[boolean] = 1
+    out_ras_prediction = drv.Create(out_ras_prediction, ncol, nrow, 1, gdal.GDT_UInt16)
+    out_ras_prediction.SetProjection(proj)
+    out_ras_prediction.SetGeoTransform(geo)       
+    out_ras_prediction.GetRasterBand(1).WriteArray(class_prediction_reshape)
+    out_ras_prediction = None
 
-    # Apply filter while ignoring ponds
-    cleaned = skimage.filters.rank.modal(raster_array, skimage.morphology.disk(disk_size), mask = mask_)
- 
-    # If pond has been changed to tundra, change it back           
-    cleaned_with_ponds = np.where(((raster_array == 2) & (cleaned == 4)), 2, cleaned)  
- 
-    # Fill nodata (0) with the most common surrounding value
-    mask2 = cleaned_with_ponds == 0
-    labels, count = label(mask2)
-    arr_out = cleaned_with_ponds.copy()
-    for idx in range(1, count + 1):
-        hole = labels == idx
-        surrounding_values = cleaned_with_ponds[binary_dilation(hole) & ~hole]
-        most_frequent = Counter(surrounding_values).most_common(1)[0][0]
-        arr_out[hole] = most_frequent
+    # Apply median filter to do salt and pepper cleanup
+    cleaned = skimage.filters.rank.modal(class_prediction_reshape, skimage.morphology.disk(f))
     
-
-    out_ras = drv.Create(out_raster, ncol, nrow, 1, gdal.GDT_Byte)
-    out_ras.SetProjection(proj)
-    out_ras.SetGeoTransform(ext)       
-    out_ras.GetRasterBand(1).WriteArray(arr_out)
-    out_ras = None
+    # Reshape our cleaned classification map
+    cleaned = cleaned.reshape(img[:, :, 0].shape)
     
+    # Subset the classification image with the validation image = X
+    # Mask the classes on the validation dataset = y
+    # These will have n_samples rows
+    X_v = cleaned[val > 0]
+    y_v = val[val > 0]
 
+    # Check accuracy of model wtih default scikit-learn parameters
+    print(confusion_matrix(y_v, X_v))
+    print(classification_report(y_v, X_v))
+    print(accuracy_score(y_v, X_v))
+    
+    out_ras_cleaned = drv.Create(out_ras_clean, ncol, nrow, 1, gdal.GDT_Byte)
+    out_ras_cleaned.SetProjection(proj)
+    out_ras_cleaned.SetGeoTransform(geo)       
+    out_ras_cleaned.GetRasterBand(1).WriteArray(cleaned)
+    out_ras_cleaned = None
+    
+    return 
+    
 
 ## Calculate area covered by each water body based on class pixels
 def calc_wb_areas(in_raster, wbs_dict):
     # Open reprojected raster
-    raster = gdal.Open(in_raster)
-    raster_array = raster.GetRasterBand(1).ReadAsArray()
+    raster = gdal.Open(in_raster)  
+    raster_array = raster.GetRasterBand(1).ReadAsArray()  
 
-    # Sum pixel amount of each class
-    count = Counter(raster_array.flatten())
-
-    # Extract total of each class into list
-    wbs = []
-    wb_pixel_sum = []
-    for class_, i in count.items():
-        wb_pixel_sum.append(i)
-        wbs.append(list(wbs_dict)[class_-1])
-            
-
+    # Create dictionary with class name : amount of pixels
+    dicts = {}
+    for key, value in wbs_dict.items():
+        dicts[key] = len(raster_array[raster_array==value])
+        
+    
     # Get pixel size and calculate area
     gt = raster.GetGeoTransform()
     pixel_area = gt[1] * (-gt[5])
     
-    total_area = sum(wb_pixel_sum) * pixel_area
+    total_area = sum(dicts.values()) * pixel_area
 
     # Multiply each total in list with pixel_area to get area covered by wb in km2
-    # Create list of names matching numbers
+    # Create dictionary of classes and corresponding area in km2     
     wb_areas = {}
-    for i,j in zip(wb_pixel_sum, wbs):
-        wb_areas[j] = round(i*pixel_area*10**-6,2)
-    
-    return wb_areas, wb_pixel_sum, total_area
-    
-
-# The next two functions are extra, not sure they work yet
-def fitting_random_search(img, trai, i):
-    
-    # Create ranfom hyperparameter grid
-    # Number of trees in random forest
-    n_estimators = [int(x) for x in np.linspace(start = 200, stop = 2000, num = 10)]
-    # Number of features to consider at every split
-    max_features = ['auto', 'sqrt']
-    # Maximum number of levels in tree
-    max_depth = [int(x) for x in np.linspace(10, 110, num = 11)]
-    max_depth.append(None)
-    # Minimum number of samples required to split a node
-    min_samples_split = [2, 5, 10]
-    # Minimum number of samples required at each leaf node
-    min_samples_leaf = [1, 2, 4]
-    # Method of selecting samples for training each tree
-    bootstrap = [True, False]# Create the random grid
-    random_grid = {'n_estimators': n_estimators,
-               'max_features': max_features,
-               'max_depth': max_depth,
-               'min_samples_split': min_samples_split,
-               'min_samples_leaf': min_samples_leaf,
-               'bootstrap': bootstrap}
-    pprint(random_grid)
+    for key, value in dicts.items():
+       wb_areas[key] = round(value*pixel_area*10**-6,2)
        
-    # Use the random grid to search for best hyperparameters
-    rf = RandomForestClassifier()
-    rf_random = RandomizedSearchCV(estimator = rf, param_distributions = random_grid, n_inter = 100, cv = 3, verbose = 2, random_state = 42, n_jobs = -1)
-    rf_random.fit(X_train, y_train)
+    # Create dictionary of classes and corresponding area in % of total study area   
+    wb_areas_perc = {}
+    for key, value in dicts.items():
+       wb_areas_perc[key] = round((value*pixel_area)/total_area, 2) * 100    
     
-    # View parameters from fitting random search
-    return rf_random.best_params_, X_train, y_train, X_test, y_test
+    return wb_areas, wb_areas_perc
 
-def evaluate(model, test_features, test_labels):
-    pred = model.predict(test_features)
-    errors = abs(pred - test_labels)
-    mape = 100 * np.mean(errors / test_labels)
-    accuracy = 100 - mape
-    print('Model Performance')
-    print('Average Error: {:0.4f} degrees.'.format(np.mean(errors)))
-    print('Accuracy = {0.2f}%.'.format(accuracy))
-    return accuracy
-    
