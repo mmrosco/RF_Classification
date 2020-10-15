@@ -2,7 +2,7 @@
 """
 Created on Wed Jul 29 18:26:43 2020
 
-@author: mmo990
+@author: Melanie Martyn Rosco
 
 This script is based on the Classification script from Chris Holden and Florian Beyer
 """
@@ -13,32 +13,21 @@ import gdal
 import pandas as pd
 import numpy as np
 import geopandas as gpd
-from collections import Counter
 import math
 import sys
 from osgeo import ogr, gdal_array, gdalconst
-from scipy.ndimage import label, binary_dilation, median_filter
 from shapely.geometry import box
 
 import rasterio
-from rasterio import warp
-from rasterio.crs import CRS
 from rasterio.mask import mask
 
-import matplotlib
 import matplotlib.pyplot as plt
 
-import sklearn
-from sklearn import ensemble
 from sklearn.ensemble import RandomForestClassifier
 #from sklearn.ensemble.RandomForestClassifier import get_params
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 from sklearn.model_selection import train_test_split, GridSearchCV
-import pprint
 
-import skimage
-from skimage.filters.rank import modal
-from skimage.morphology import disk
 
 
 # --------------------------------------------------------
@@ -405,30 +394,8 @@ def classification_with_hyperparameter_optimisation(img, trai, val, out_ras_pred
     out_ras_prediction.GetRasterBand(1).WriteArray(class_prediction)
     out_ras_prediction = None
 
-    # Apply median filter to do salt and pepper cleanup
-    cleaned = skimage.filters.rank.modal(class_prediction, skimage.morphology.disk(f))
-    
-    # Reshape our cleaned classification map
-    cleaned = cleaned.reshape(img[:, :, 0].shape)
-    
-    # Subset the classification image with the validation image = X
-    # Mask the classes on the validation dataset = y
-    # These will have n_samples rows
-    X_v = cleaned[val > 0]
-    y_v = val[val > 0]
-
-    # Check accuracy of model wtih default scikit-learn parameters
-    print(confusion_matrix(y_v, X_v))
-    print(classification_report(y_v, X_v))
-    print(accuracy_score(y_v, X_v))
-    
-    out_ras_cleaned = drv.Create(out_ras_clean, ncol, nrow, 1, gdal.GDT_Byte)
-    out_ras_cleaned.SetProjection(proj)
-    out_ras_cleaned.SetGeoTransform(geo)       
-    out_ras_cleaned.GetRasterBand(1).WriteArray(cleaned)
-    out_ras_cleaned = None
-    
     return 
+
 
 # Classification without GridSearch to find the best hyperparameters (faster)
 def classification(img, trai, val, out_ras_prediction, out_ras_clean, f):
@@ -529,39 +496,104 @@ def classification(img, trai, val, out_ras_prediction, out_ras_clean, f):
     
     class_prediction_reshape.astype(np.float16)
     
-    out_ras_prediction = drv.Create(out_ras_prediction, ncol, nrow, 1, gdal.GDT_UInt16)
-    out_ras_prediction.SetProjection(proj)
-    out_ras_prediction.SetGeoTransform(geo)       
-    out_ras_prediction.GetRasterBand(1).WriteArray(class_prediction_reshape)
-    out_ras_prediction = None
+    out_ras_pred = drv.Create(out_ras_prediction, ncol, nrow, 1, gdal.GDT_UInt16)
+    out_ras_pred.SetProjection(proj)
+    out_ras_pred.SetGeoTransform(geo)       
+    out_ras_pred.GetRasterBand(1).WriteArray(class_prediction_reshape)
+    out_ras_pred = None
+    
+    return 
+  
+# Function for salt and pepper cleanup, first cleanup was done in QGIS with gdal.sieve
+# Adjust limits to boundaries of input 
+def cleanup(in_ras, out_ras):
+    raster = gdal.Open(in_ras)  
+    raster_array = raster.GetRasterBand(1).ReadAsArray() 
+    
+    geo =  raster.GetGeoTransform()
+    proj =  raster.GetProjectionRef()    
+  
+    rows = raster_array.shape[0]
+    cols = raster_array.shape[1]
+    
+    # Adjust depending on boundaries of input raster and sub_array size used in loop
+    limits = [1636, 1637, 1638, 1639, 2715, 2716, 2717]
+    
+    for index, value in np.ndenumerate(raster_array):
+        # Skips to next loop if index contains limit number
+            if any(t in index for t in limits):
+                continue
+            # Adjust value depending on class value used and being considered - here 2 is a fluvial pixel
+            if value == 2:
+                row_indices = [index[0]-2, index[0]-1, index[0], index[0]+1, index[0]+2] # 5x5, adjust to change sub-array size
+                col_indices = [index[1]-2, index[1]-1, index[1], index[1]+1, index[1]+2] # 5x5
+                sub_arr = raster_array[np.ix_(row_indices,col_indices)] # Create sub-array around element being considered
+                idxs = [(1,1), (1,2), (1,3), (2,1), (2,2), (2,3), (3,1), (3,2), (3,3)]
+                idxs = [i*sub_arr.shape[1]+j for i, j in idxs]
+                sub_arr = np.delete(sub_arr, idxs)  # Delete inner array elements to only consider outer row and columns (position in flattened array = row * no_of_columns + column)
+                if np.sum(sub_arr == 2) < 4:
+                    print('Replacing stream with pond')
+                    print(index[0], index[1])
+                    raster_array[index[0],index[1]] = 1
+                elif np.any(sub_arr == 0):
+                    print('Replacing stream with lake')
+                    print(index[0], index[1])
+                    raster_array[index[0],index[1]] = 0     
+            # Adjust value depending on class value used and being considered - here 1 is a pond pixel
+            elif value == 1:
+                row_indices = [index[0]-2, index[0]-1, index[0], index[0]+1, index[0]+2] # 5x5, adjust to change sub-array size
+                col_indices = [index[1]-2, index[1]-1, index[1], index[1]+1, index[1]+2] # 5x5  
+                sub_arr = raster_array[np.ix_(row_indices,col_indices)] # Create sub-array around element being considered
+                idxs = [(1,1), (1,2), (1,3), (2,1), (2,2), (2,3), (3,1), (3,2), (3,3)]
+                idxs = [i*sub_arr.shape[1]+j for i, j in idxs]
+                sub_arr = np.delete(sub_arr, idxs)  # Delete inner array elements to only consider outer row and columns (position in flattened array = row * no_of_columns + column)
+                if np.sum(sub_arr == 2) > 10:
+                    print('Replacing pond with stream')
+                    print(index[0], index[1])
+                    raster_array[index[0],index[1]] = 2
 
-    # Apply median filter to do salt and pepper cleanup
-    cleaned = skimage.filters.rank.modal(class_prediction_reshape, skimage.morphology.disk(f))
-    
-    # Reshape our cleaned classification map
-    cleaned = cleaned.reshape(img[:, :, 0].shape)
-    
-    # Subset the classification image with the validation image = X
-    # Mask the classes on the validation dataset = y
-    # These will have n_samples rows
-    X_v = cleaned[val > 0]
-    y_v = val[val > 0]
+    drv = gdal.GetDriverByName('GTiff')           
+    out_ras_cleaned = drv.Create(out_ras, cols, rows, 1, gdal.GDT_Byte)
+    out_ras_cleaned.SetProjection(proj)
+    out_ras_cleaned.SetGeoTransform(geo)       
+    out_ras_cleaned.GetRasterBand(1).WriteArray(raster_array)
+    out_ras_cleaned = None      
+
+    return out_ras_cleaned       
+ 
+# Returns confusion matrix, classification report and accuracy score for classified raster pre and post cleanup    
+def quality_check(class_raster, cleaned_raster, test_raster):
+    # Read in classified raster
+    img_ds = gdal.Open(class_raster)
+    img = img_ds.GetRasterBand(1).ReadAsArray() 
+        
+    # Read in cleaned classification raster
+    clean_ds = gdal.Open(cleaned_raster)
+    clean = clean_ds.GetRasterBand(1).ReadAsArray()
+           
+    # Read in training data raster
+    test_ds = gdal.Open(test_raster)        
+    test = test_ds.GetRasterBand(1).ReadAsArray().astype(np.uint8)
+
+    X_v = img[test > 0]
+    y_v = test[test > 0]
 
     # Check accuracy of model wtih default scikit-learn parameters
     print(confusion_matrix(y_v, X_v))
     print(classification_report(y_v, X_v))
     print(accuracy_score(y_v, X_v))
     
-    out_ras_cleaned = drv.Create(out_ras_clean, ncol, nrow, 1, gdal.GDT_Byte)
-    out_ras_cleaned.SetProjection(proj)
-    out_ras_cleaned.SetGeoTransform(geo)       
-    out_ras_cleaned.GetRasterBand(1).WriteArray(cleaned)
-    out_ras_cleaned = None
-    
-    return 
-    
+    X_v = clean[test > 0]
+    y_v = test[test > 0]
 
-## Calculate area covered by each water body based on class pixels
+    # Check accuracy of model wtih default scikit-learn parameters
+    print(confusion_matrix(y_v, X_v))
+    print(classification_report(y_v, X_v))
+    print(accuracy_score(y_v, X_v))
+    
+    return
+
+# Calculate area covered by each water body based on class pixels
 def calc_wb_areas(in_raster, wbs_dict):
     # Open reprojected raster
     raster = gdal.Open(in_raster)  
@@ -571,8 +603,7 @@ def calc_wb_areas(in_raster, wbs_dict):
     dicts = {}
     for key, value in wbs_dict.items():
         dicts[key] = len(raster_array[raster_array==value])
-        
-    
+           
     # Get pixel size and calculate area
     gt = raster.GetGeoTransform()
     pixel_area = gt[1] * (-gt[5])
@@ -591,4 +622,7 @@ def calc_wb_areas(in_raster, wbs_dict):
        wb_areas_perc[key] = round((value*pixel_area)/total_area, 2) * 100    
     
     return wb_areas, wb_areas_perc
+
+
+
 
